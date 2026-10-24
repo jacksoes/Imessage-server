@@ -14,13 +14,15 @@ const toolDeclarations: FunctionDeclaration[] = [{
   },
 }, {
   name: "searchFlights",
-  description: "Search the configured Google Flights API for flights departing from an airport. Call this when the user asks to find, search for, or compare flights. The API currently accepts an origin airport code only.",
+  description: "Search live Google Flights results for a one-way flight. Call only after you know the departure airport, arrival airport, and travel date. Ask a follow-up if any are missing or ambiguous. Use three-letter IATA airport codes.",
   parameters: {
     type: Type.OBJECT,
     properties: {
-      origin: { type: Type.STRING, description: "Departure airport code, for example JFK or SFO." },
+      origin: { type: Type.STRING, description: "Three-letter IATA departure airport code, for example JFK." },
+      destination: { type: Type.STRING, description: "Three-letter IATA arrival airport code, for example MCO." },
+      outboundDate: { type: Type.STRING, description: "Departure date in YYYY-MM-DD format." },
     },
-    required: ["origin"],
+    required: ["origin", "destination", "outboundDate"],
   },
 }];
 
@@ -43,20 +45,36 @@ function rememberTurn(chatId: string, turn: ChatTurn): void {
   }
 }
 
-async function searchFlights(origin: string): Promise<unknown> {
-  const baseUrl = process.env.FLIGHTS_API_BASE_URL;
-  if (!baseUrl) {
-    return { error: "Flight search is not configured. Set FLIGHTS_API_BASE_URL to the real API base URL." };
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function searchFlights(origin: string, destination: string, outboundDate: string): Promise<string> {
+  const apiKey = process.env.SERPAPI_API_KEY;
+  if (!apiKey) {
+    return "Flight search is not configured. Set SERPAPI_API_KEY to a SerpApi key.";
   }
 
   try {
-    const apiBase = new URL(baseUrl);
-    if (apiBase.protocol !== "http:" && apiBase.protocol !== "https:") {
-      return { error: "FLIGHTS_API_BASE_URL must be an absolute http(s) URL, such as https://your-flight-api.example." };
+    const departure = origin.trim().toUpperCase();
+    const arrival = destination.trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(departure) || !/^[A-Z]{3}$/.test(arrival)) {
+      return "Please provide a departure and destination airport using three-letter IATA codes.";
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(outboundDate)) {
+      return "Please provide the travel date in YYYY-MM-DD format.";
     }
 
-    const url = new URL("/flights/search", apiBase);
-    url.searchParams.set("origin", origin.trim().toUpperCase());
+    const url = new URL("https://serpapi.com/search.json");
+    url.searchParams.set("engine", "google_flights");
+    url.searchParams.set("departure_id", departure);
+    url.searchParams.set("arrival_id", arrival);
+    url.searchParams.set("outbound_date", outboundDate);
+    url.searchParams.set("type", "2"); // one-way
+    url.searchParams.set("currency", "USD");
+    url.searchParams.set("hl", "en");
+    url.searchParams.set("gl", "us");
+    url.searchParams.set("api_key", apiKey);
 
     const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
     const body = await response.text();
@@ -64,16 +82,42 @@ async function searchFlights(origin: string): Promise<unknown> {
     try {
       result = JSON.parse(body);
     } catch {
-      result = body.slice(0, 8_000);
+      return `Google Flights search failed with HTTP ${response.status}.`;
     }
 
-    if (!response.ok) {
-      return { error: `Flight API returned HTTP ${response.status}.`, details: result };
+    if (!response.ok || !isRecord(result)) {
+      return `Google Flights search failed with HTTP ${response.status}.`;
     }
 
-    return result;
+    if (typeof result.error === "string") return `Google Flights search failed: ${result.error}`;
+
+    const bestFlights = Array.isArray(result.best_flights) ? result.best_flights : [];
+    const otherFlights = Array.isArray(result.other_flights) ? result.other_flights : [];
+    const itinerary = isRecord(bestFlights[0]) ? bestFlights[0] : isRecord(otherFlights[0]) ? otherFlights[0] : undefined;
+    if (!itinerary || !Array.isArray(itinerary.flights) || itinerary.flights.length === 0) {
+      return "No matching flights were found for that route and date.";
+    }
+
+    const segments = itinerary.flights.map((segment, index) => {
+      if (!isRecord(segment)) return `Segment ${index + 1}: details unavailable`;
+      const departureAirport = isRecord(segment.departure_airport) ? segment.departure_airport : {};
+      const arrivalAirport = isRecord(segment.arrival_airport) ? segment.arrival_airport : {};
+      const flightNumber = typeof segment.flight_number === "string" ? segment.flight_number : "flight number unavailable";
+      const airline = typeof segment.airline === "string" ? segment.airline : "Airline unavailable";
+      const from = typeof departureAirport.id === "string" ? departureAirport.id : departure;
+      const to = typeof arrivalAirport.id === "string" ? arrivalAirport.id : arrival;
+      const departTime = typeof departureAirport.time === "string" ? departureAirport.time : "time unavailable";
+      const arriveTime = typeof arrivalAirport.time === "string" ? arrivalAirport.time : "time unavailable";
+      return `${index + 1}. ${airline} ${flightNumber}: ${from} ${departTime} → ${to} ${arriveTime}`;
+    });
+
+    const price = typeof itinerary.price === "number" ? `Price shown: $${itinerary.price} USD.` : "Price unavailable.";
+    const totalDuration = typeof itinerary.total_duration === "number" ? `Total duration: ${itinerary.total_duration} minutes.` : "";
+    const metadata = isRecord(result.search_metadata) ? result.search_metadata : {};
+    const flightsUrl = typeof metadata.google_flights_url === "string" ? metadata.google_flights_url : "";
+    return ["Top Google Flights result (not booked):", ...segments, price, totalDuration, flightsUrl].filter(Boolean).join("\n");
   } catch (error) {
-    return { error: "Could not reach the Flight API.", details: String(error) };
+    return `Could not reach Google Flights search: ${String(error)}`;
   }
 }
 
@@ -104,7 +148,7 @@ for await (const [space, message] of app.messages) {
         model: 'gemini-2.5-flash',
         contents: conversation,
         config: {
-          systemInstruction: "You are a helpful and concise assistant responding via iMessage/RCS. When the user asks to test or verify tool calling, call verify_tool. When the user asks to search for flights, call searchFlights with their departure airport code, then summarize only the returned API results. If the API reports that it is not configured, tell the user to set FLIGHTS_API_BASE_URL.",
+          systemInstruction: "You are a helpful and concise assistant responding via iMessage/RCS. When the user asks to test or verify tool calling, call verify_tool. For flight searches, use the searchFlights tool only after you have a departure airport, destination airport, and travel date. If a request is ambiguous (for example, a state with several airports) or any detail is missing, ask a concise follow-up instead of guessing. The tool returns the top Google Flights result and its flight number(s); do not invent, book, or claim that the flight is reserved.",
           tools: [{ functionDeclarations: toolDeclarations }],
         }
       });
@@ -122,11 +166,13 @@ for await (const [space, message] of app.messages) {
             result = { result: `✅ TOOL RAN: ${phrase}` };
           } else if (toolCall.name === "searchFlights") {
             const origin = typeof toolCall.args?.origin === "string" ? toolCall.args.origin : "";
-            if (!origin.trim()) {
-              result = { error: "An origin airport code is required." };
+            const destination = typeof toolCall.args?.destination === "string" ? toolCall.args.destination : "";
+            const outboundDate = typeof toolCall.args?.outboundDate === "string" ? toolCall.args.outboundDate : "";
+            if (!origin.trim() || !destination.trim() || !outboundDate.trim()) {
+              result = "Departure airport, destination airport, and travel date are required.";
             } else {
-              console.log(`[TOOL CALLED] searchFlights({ origin: "${origin}" })`);
-              result = await searchFlights(origin);
+              console.log(`[TOOL CALLED] searchFlights({ origin: "${origin}", destination: "${destination}", outboundDate: "${outboundDate}" })`);
+              result = await searchFlights(origin, destination, outboundDate);
             }
           } else {
             result = { error: `Unknown tool: ${toolCall.name}` };
@@ -137,7 +183,7 @@ for await (const [space, message] of app.messages) {
 
         replyText = toolResults.map(({ name, result }) => name === "verify_tool"
           ? String((result as { result: string }).result)
-          : `Flight search results:\n${JSON.stringify(result, null, 2)}`)
+          : String(result))
           .join("\n\n");
       }
 
