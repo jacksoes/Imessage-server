@@ -1,6 +1,6 @@
 import { Spectrum } from "spectrum-ts";
 import { imessage } from "@spectrum-ts/imessage";
-import { GoogleGenAI, Type, type FunctionDeclaration } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel, Type, type FunctionDeclaration } from "@google/genai";
 
 const toolDeclarations: FunctionDeclaration[] = [{
   name: "verify_tool",
@@ -14,13 +14,14 @@ const toolDeclarations: FunctionDeclaration[] = [{
   },
 }, {
   name: "searchFlights",
-  description: "Search live Google Flights results for a one-way flight. Call only after you know the departure airport, arrival airport, and travel date. Ask a follow-up if any are missing or ambiguous. Use three-letter IATA airport codes.",
+  description: "Search live Google Flights results for a one-way flight. Call only after you know the departure airport, arrival airport, and travel date. Ask a follow-up if any are missing or ambiguous. Use three-letter IATA airport codes. Set departureWindow when the user requests a time of day.",
   parameters: {
     type: Type.OBJECT,
     properties: {
       origin: { type: Type.STRING, description: "Three-letter IATA departure airport code, for example JFK." },
       destination: { type: Type.STRING, description: "Three-letter IATA arrival airport code, for example MCO." },
       outboundDate: { type: Type.STRING, description: "Departure date in YYYY-MM-DD format." },
+      departureWindow: { type: Type.STRING, enum: ["morning", "afternoon", "evening", "any"], description: "Requested local departure time window. Morning is before noon; afternoon is noon to 6 PM; evening is 6 PM to midnight." },
     },
     required: ["origin", "destination", "outboundDate"],
   },
@@ -28,7 +29,7 @@ const toolDeclarations: FunctionDeclaration[] = [{
 
 type ChatTurn = { role: "user" | "assistant"; text: string };
 const chatMemory = new Map<string, ChatTurn[]>();
-const MAX_TURNS_PER_CHAT = 20;
+const MAX_TURNS_PER_CHAT = 10;
 const MAX_CHATS_IN_MEMORY = 100;
 
 function rememberTurn(chatId: string, turn: ChatTurn): void {
@@ -49,7 +50,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function searchFlights(origin: string, destination: string, outboundDate: string): Promise<string> {
+async function searchFlights(origin: string, destination: string, outboundDate: string, departureWindow: string): Promise<string> {
   const apiKey = process.env.SERPAPI_API_KEY;
   if (!apiKey) {
     return "Flight search is not configured. Set SERPAPI_API_KEY to a SerpApi key.";
@@ -71,6 +72,12 @@ async function searchFlights(origin: string, destination: string, outboundDate: 
     url.searchParams.set("arrival_id", arrival);
     url.searchParams.set("outbound_date", outboundDate);
     url.searchParams.set("type", "2"); // one-way
+    const outboundTimes: Record<string, string> = {
+      morning: "0,11",
+      afternoon: "12,17",
+      evening: "18,23",
+    };
+    if (outboundTimes[departureWindow]) url.searchParams.set("outbound_times", outboundTimes[departureWindow]);
     url.searchParams.set("currency", "USD");
     url.searchParams.set("hl", "en");
     url.searchParams.set("gl", "us");
@@ -121,7 +128,10 @@ async function searchFlights(origin: string, destination: string, outboundDate: 
   }
 }
 
-const ai = new GoogleGenAI();
+const GEMINI_MODEL = "gemini-3.8-flash";
+const geminiApiKey = process.env.GEMINI_API_KEY;
+if (!geminiApiKey) throw new Error("GEMINI_API_KEY is required to start the agent.");
+const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
 const app = await Spectrum({
   projectId: process.env.PROJECT_ID!,
@@ -145,13 +155,19 @@ for await (const [space, message] of app.messages) {
       ].join("\n");
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: GEMINI_MODEL,
         contents: conversation,
         config: {
-          systemInstruction: "You are a helpful and concise assistant responding via iMessage/RCS. When the user asks to test or verify tool calling, call verify_tool. For flight searches, use the searchFlights tool only after you have a departure airport, destination airport, and travel date. If a request is ambiguous (for example, a state with several airports) or any detail is missing, ask a concise follow-up instead of guessing. The tool returns the top Google Flights result and its flight number(s); do not invent, book, or claim that the flight is reserved.",
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          maxOutputTokens: 512,
+          systemInstruction: "You are a helpful and concise assistant responding via iMessage/RCS. When the user asks to test or verify tool calling, call verify_tool. For flight searches, use the searchFlights tool only after you have a departure airport, destination airport, and travel date. If a request is ambiguous (for example, a state with several airports) or any detail is missing, ask a concise follow-up instead of guessing. Morning means before noon; if the user also says before 12 AM/midnight, clarify because that conflicts with morning. The tool returns the top Google Flights result and its flight number(s); do not invent, book, or claim that the flight is reserved.",
           tools: [{ functionDeclarations: toolDeclarations }],
         }
       });
+      const usage = response.usageMetadata;
+      if (usage) {
+        console.log(`[GEMINI USAGE] model=${GEMINI_MODEL} input_tokens=${usage.promptTokenCount ?? 0} output_tokens=${usage.candidatesTokenCount ?? 0} total_tokens=${usage.totalTokenCount ?? 0}`);
+      }
 
       const toolCalls = response.functionCalls ?? [];
       let replyText = response.text || "I couldn't generate a response.";
@@ -168,11 +184,12 @@ for await (const [space, message] of app.messages) {
             const origin = typeof toolCall.args?.origin === "string" ? toolCall.args.origin : "";
             const destination = typeof toolCall.args?.destination === "string" ? toolCall.args.destination : "";
             const outboundDate = typeof toolCall.args?.outboundDate === "string" ? toolCall.args.outboundDate : "";
+            const departureWindow = typeof toolCall.args?.departureWindow === "string" ? toolCall.args.departureWindow : "any";
             if (!origin.trim() || !destination.trim() || !outboundDate.trim()) {
               result = "Departure airport, destination airport, and travel date are required.";
             } else {
-              console.log(`[TOOL CALLED] searchFlights({ origin: "${origin}", destination: "${destination}", outboundDate: "${outboundDate}" })`);
-              result = await searchFlights(origin, destination, outboundDate);
+              console.log(`[TOOL CALLED] searchFlights({ origin: "${origin}", destination: "${destination}", outboundDate: "${outboundDate}", departureWindow: "${departureWindow}" })`);
+              result = await searchFlights(origin, destination, outboundDate, departureWindow);
             }
           } else {
             result = { error: `Unknown tool: ${toolCall.name}` };
