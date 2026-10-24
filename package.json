@@ -8,6 +8,7 @@
     "dev": "bun --watch src/index.ts"
   },
   "dependencies": {
+    "@google/genai": "^2.31.0",
     "spectrum-ts": "^12.14.0"
   },
   "devDependencies": {
